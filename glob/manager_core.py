@@ -44,7 +44,7 @@ import manager_migration
 from node_package import InstalledNodePackage
 
 
-version_code = [3, 39]
+version_code = [3, 42]
 version_str = f"V{version_code[0]}.{version_code[1]}" + (f'.{version_code[2]}' if len(version_code) > 2 else '')
 
 
@@ -953,10 +953,10 @@ class UnifiedManager:
 
         return res
 
-    def reserve_cnr_switch(self, target, zip_url, from_path, to_path, no_deps):
+    def reserve_cnr_switch(self, target, zip_url, from_path, to_path, no_deps, status=''):
         script_path = os.path.join(manager_startup_script_path, "install-scripts.txt")
         with open(script_path, "a") as file:
-            obj = [target, "#LAZY-CNR-SWITCH-SCRIPT", zip_url, from_path, to_path, no_deps, get_default_custom_nodes_path(), sys.executable]
+            obj = [target, "#LAZY-CNR-SWITCH-SCRIPT", zip_url, from_path, to_path, no_deps, get_default_custom_nodes_path(), sys.executable, status]
             file.write(f"{obj}\n")
 
         print(f"Installation reserved: {target}")
@@ -982,35 +982,45 @@ class UnifiedManager:
 
         return result
 
+    def _get_cnr_install_info(self, node_id, version_spec):
+        node_info = cnr_utils.install_node(node_id, version_spec)
+        if node_info is not None and node_info.status == 'NodeVersionStatusFlagged' and not manager_funcs.is_flagged_install_allowed():
+            logging.error(manager_util.FLAGGED_NODEPACK_INSTALL_GUIDANCE)
+            raise PermissionError(manager_util.FLAGGED_NODEPACK_INSTALL_ERROR)
+        return node_info
+
     def cnr_switch_version(self, node_id, version_spec=None, instant_execution=False, no_deps=False, return_postinstall=False):
-        if instant_execution:
-            return self.cnr_switch_version_instant(node_id, version_spec, instant_execution, no_deps, return_postinstall)
-        else:
-            return self.cnr_switch_version_lazy(node_id, version_spec, no_deps, return_postinstall)
-
-    def cnr_switch_version_lazy(self, node_id, version_spec=None, no_deps=False, return_postinstall=False):
-        """
-        switch between cnr version (lazy mode)
-        """
-
         result = ManagedResult('switch-cnr')
 
-        node_info = cnr_utils.install_node(node_id, version_spec)
+        try:
+            node_info = self._get_cnr_install_info(node_id, version_spec)
+        except PermissionError as exc:
+            return result.fail(str(exc))
         if node_info is None or not node_info.download_url:
             return result.fail(f'not available node: {node_id}@{version_spec}')
 
-        version_spec = node_info.version
+        return self._cnr_switch_version(node_id, node_info, instant_execution, no_deps, return_postinstall)
 
-        if self.active_nodes[node_id][0] == version_spec:
+    def _cnr_switch_version(self, node_id, node_info, instant_execution=False, no_deps=False, return_postinstall=False):
+        """Execute a switch using the checked CNR response."""
+        if self.active_nodes[node_id][0] == node_info.version:
             return ManagedResult('skip').with_msg("Up to date")
 
+        if instant_execution:
+            return self._cnr_switch_version_instant(node_id, node_info, no_deps, return_postinstall)
+        return self._cnr_switch_version_lazy(node_id, node_info, no_deps, return_postinstall)
+
+    def _cnr_switch_version_lazy(self, node_id, node_info, no_deps=False, return_postinstall=False):
+        """Reserve a switch using the validated install response."""
+        result = ManagedResult('switch-cnr')
+        version_spec = node_info.version
         zip_url = node_info.download_url
         from_path = self.active_nodes[node_id][1]
         target = node_id
         to_path = os.path.join(get_default_custom_nodes_path(), target)
 
         def postinstall():
-            return self.reserve_cnr_switch(target, zip_url, from_path, to_path, no_deps)
+            return self.reserve_cnr_switch(target, zip_url, from_path, to_path, no_deps, node_info.status)
 
         if return_postinstall:
             return result.with_postinstall(postinstall)
@@ -1020,23 +1030,12 @@ class UnifiedManager:
 
         return result
 
-    def cnr_switch_version_instant(self, node_id, version_spec=None, instant_execution=True, no_deps=False, return_postinstall=False):
-        """
-        switch between cnr version
-        """
-
-        # 1. download
+    def _cnr_switch_version_instant(self, node_id, node_info, no_deps=False, return_postinstall=False):
+        """Apply a switch using the validated install response."""
         result = ManagedResult('switch-cnr')
-
-        node_info = cnr_utils.install_node(node_id, version_spec)
-        if node_info is None or not node_info.download_url:
-            return result.fail(f'not available node: {node_id}@{version_spec}')
-
         version_spec = node_info.version
 
-        if self.active_nodes[node_id][0] == version_spec:
-            return ManagedResult('skip').with_msg("Up to date")
-
+        # 1. download
         archive_name = f"CNR_temp_{str(uuid.uuid4())}.zip"  # should be unpredictable name - security precaution
         download_path = os.path.join(get_default_custom_nodes_path(), archive_name)
         manager_downloader.basic_download_url(node_info.download_url, get_default_custom_nodes_path(), archive_name)
@@ -1081,7 +1080,7 @@ class UnifiedManager:
         result.target = version_spec
 
         def postinstall():
-            res = self.execute_install_script(f"{node_id}@{version_spec}", install_path, instant_execution=instant_execution, no_deps=no_deps)
+            res = self.execute_install_script(f"{node_id}@{version_spec}", install_path, instant_execution=True, no_deps=no_deps)
             return res
 
         if return_postinstall:
@@ -1298,9 +1297,23 @@ class UnifiedManager:
         if 'comfyui-manager' in node_id.lower():
             return result.fail(f"ignored: installing '{node_id}'")
 
-        node_info = cnr_utils.install_node(node_id, version_spec)
+        try:
+            node_info = self._get_cnr_install_info(node_id, version_spec)
+        except PermissionError as exc:
+            return result.fail(str(exc))
         if node_info is None or not node_info.download_url:
             return result.fail(f'not available node: {node_id}@{version_spec}')
+
+        result = self._cnr_install(node_id, node_info, instant_execution, no_deps, return_postinstall)
+        # Keep the requested version in the public result.
+        if result.target is not None:
+            result.target = version_spec
+        return result
+
+    def _cnr_install(self, node_id, node_info, instant_execution=False, no_deps=False, return_postinstall=False):
+        """Install using the checked CNR response."""
+        result = ManagedResult('install-cnr')
+        version_spec = node_info.version
 
         archive_name = f"CNR_temp_{str(uuid.uuid4())}.zip"  # should be unpredictable name - security precaution
         download_path = os.path.join(get_default_custom_nodes_path(), archive_name)
@@ -1490,21 +1503,13 @@ class UnifiedManager:
             else:
                 version_spec = self.resolve_unspecified_version(node_id)
 
-        if version_spec == 'unknown' or version_spec == 'nightly':
+        if version_spec in ('unknown', 'nightly'):
             try:
-                custom_nodes = await self.get_custom_nodes(channel, mode)
-            except InvalidChannel as e:
-                return ManagedResult('fail').fail(f'Invalid channel is used: {e.channel}')
-
-            the_node = custom_nodes.get(node_id)
-            if the_node is not None:
-                if version_spec == 'unknown':
-                    repo_url = the_node['files'][0]
-                else:  # nightly
-                    repo_url = the_node['repository']
-            else:
-                result = ManagedResult('install')
-                return result.fail(f"Node '{node_id}@{version_spec}' not found in [{channel}, {mode}]")
+                repo_url = await self._get_git_install_url(node_id, version_spec, channel, mode)
+            except InvalidChannel as exc:
+                return ManagedResult('fail').fail(f'Invalid channel is used: {exc.channel}')
+            except LookupError as exc:
+                return ManagedResult('install').fail(str(exc))
 
         if self.is_enabled(node_id, version_spec):
             return ManagedResult('skip').with_target(f"{node_id}@{version_spec}")
@@ -1512,24 +1517,17 @@ class UnifiedManager:
         elif self.is_disabled(node_id, version_spec):
             return self.unified_enable(node_id, version_spec)
 
-        elif version_spec == 'unknown' or version_spec == 'nightly':
-            if version_spec == 'nightly':
-                # disable cnr nodes
-                if self.is_enabled(node_id, 'cnr'):
-                    self.unified_disable(node_id, False)
+        elif version_spec in ('unknown', 'nightly'):
+            return self._install_git(node_id, version_spec, repo_url, instant_execution, no_deps, return_postinstall)
 
-            to_path = os.path.abspath(os.path.join(get_default_custom_nodes_path(), node_id))
-            res = self.repo_install(repo_url, to_path, instant_execution=instant_execution, no_deps=no_deps, return_postinstall=return_postinstall)
-            if res.result:
-                if version_spec == 'unknown':
-                    self.unknown_active_nodes[node_id] = repo_url, to_path
-                elif version_spec == 'nightly':
-                    cnr_utils.generate_cnr_id(to_path, node_id)
-                    self.active_nodes[node_id] = 'nightly', to_path
-            else:
-                return res
-
-            return res.with_target(version_spec)
+        # Check before changing the existing pack, then reuse this response.
+        try:
+            node_info = self._get_cnr_install_info(node_id, version_spec)
+        except PermissionError as exc:
+            return ManagedResult('install-cnr').fail(str(exc))
+        if node_info is None or not node_info.download_url:
+            return ManagedResult('install-cnr').fail(f'not available node: {node_id}@{version_spec}')
+        version_spec = node_info.version
 
         if self.is_enabled(node_id, 'nightly'):
             # disable nightly nodes
@@ -1542,16 +1540,76 @@ class UnifiedManager:
         if self.is_disabled(node_id, "cnr"):
             # enable and switch version if cnr is disabled (not specified version)
             self.unified_enable(node_id, "cnr")
-            return self.cnr_switch_version(node_id, version_spec, no_deps=no_deps, return_postinstall=return_postinstall)
+            return self._cnr_switch_version(node_id, node_info, instant_execution, no_deps, return_postinstall)
 
         if self.is_enabled(node_id, "cnr"):
-            return self.cnr_switch_version(node_id, version_spec, no_deps=no_deps, return_postinstall=return_postinstall)
+            return self._cnr_switch_version(node_id, node_info, instant_execution, no_deps, return_postinstall)
 
-        res = self.cnr_install(node_id, version_spec, instant_execution=instant_execution, no_deps=no_deps, return_postinstall=return_postinstall)
+        res = self._cnr_install(node_id, node_info, instant_execution, no_deps, return_postinstall)
         if res.result:
             self.active_nodes[node_id] = version_spec, res.to_path
 
         return res
+
+    async def _get_git_install_url(self, node_id, version_spec, channel, mode):
+        custom_nodes = await self.get_custom_nodes(channel, mode)
+        node = custom_nodes.get(node_id)
+        if node is None:
+            raise LookupError(f"Node '{node_id}@{version_spec}' not found in [{channel}, {mode}]")
+        return node['files'][0] if version_spec == 'unknown' else node['repository']
+
+    def _install_git(self, node_id, version_spec, repo_url, instant_execution=False, no_deps=False, return_postinstall=False):
+        if version_spec == 'nightly':
+            # disable cnr nodes
+            if self.is_enabled(node_id, 'cnr'):
+                self.unified_disable(node_id, False)
+
+        to_path = os.path.abspath(os.path.join(get_default_custom_nodes_path(), node_id))
+        res = self.repo_install(repo_url, to_path, instant_execution=instant_execution, no_deps=no_deps, return_postinstall=return_postinstall)
+        if res.result:
+            if version_spec == 'unknown':
+                self.unknown_active_nodes[node_id] = repo_url, to_path
+            elif version_spec == 'nightly':
+                cnr_utils.generate_cnr_id(to_path, node_id)
+                self.active_nodes[node_id] = 'nightly', to_path
+        else:
+            return res
+
+        return res.with_target(version_spec)
+
+    async def reinstall_by_id(self, node_id, version_spec, channel=None, mode=None):
+        if 'comfyui-manager' in node_id.lower():
+            return ManagedResult('skip').fail(f"ignored: installing '{node_id}'")
+
+        if version_spec in ('unknown', 'nightly'):
+            try:
+                repo_url = await self._get_git_install_url(node_id, version_spec, channel, mode)
+            except InvalidChannel as exc:
+                return ManagedResult('fail').fail(f'Invalid channel is used: {exc.channel}')
+            except LookupError as exc:
+                return ManagedResult('install').fail(str(exc))
+        else:
+            try:
+                node_info = self._get_cnr_install_info(node_id, version_spec)
+            except PermissionError as exc:
+                return ManagedResult('install-cnr').fail(str(exc))
+            if node_info is None or not node_info.download_url:
+                return ManagedResult('install-cnr').fail(f'not available node: {node_id}@{version_spec}')
+
+        removed = self.unified_uninstall(node_id, version_spec == 'unknown')
+        if not removed.result:
+            return removed
+
+        for item in removed.items:
+            path = item if version_spec == 'unknown' else item[1]
+            self.processed_install.discard(os.path.join(path, 'install.py'))
+        if version_spec in ('unknown', 'nightly'):
+            return self._install_git(node_id, version_spec, repo_url)
+
+        result = self._cnr_install(node_id, node_info)
+        if result.result:
+            self.active_nodes[node_id] = node_info.version, result.to_path
+        return result
 
 
 unified_manager = UnifiedManager()
@@ -1663,6 +1721,10 @@ class ManagerFuncs:
     def __init__(self):
         pass
 
+    def is_flagged_install_allowed(self):
+        # Server-scheduled restore children inherit only the resolved permission.
+        return os.environ.get('_COMFYUI_MANAGER_CNR_ALLOW_FLAGGED', 'true') == 'true'
+
     def get_current_preview_method(self):
         return "none"
 
@@ -1679,27 +1741,147 @@ class ManagerFuncs:
 manager_funcs = ManagerFuncs()
 
 
-def write_config():
-    config = configparser.ConfigParser(strict=False)
+#: The keys `write_config()` owns in `config.ini`'s `[default]` section.
+#: Anything else in the file - other keys, other sections - is hand-maintained
+#: content that this function must carry through untouched.
+#: `preview_method` is the one key that is NOT snapshot-backed: it is always
+#: written from the live `manager_funcs.get_current_preview_method()`.
+WRITTEN_CONFIG_KEYS = (
+    'preview_method',
+    'git_exe',
+    'use_uv',
+    'channel_url',
+    'share_option',
+    'bypass_ssl',
+    'file_logging',
+    'component_policy',
+    'update_policy',
+    'windows_selector_event_loop_policy',
+    'model_download_by_agent',
+    'downgrade_blacklist',
+    'security_level',
+    'always_lazy_install',
+    'network_mode',
+    'db_mode',
+    'allow_git_url_install',
+    'allow_pip_install',
+    'allow_flagged_nodepack_install',
+)
 
-    config['default'] = {
-        'preview_method': manager_funcs.get_current_preview_method(),
-        'git_exe': get_config()['git_exe'],
-        'use_uv': get_config()['use_uv'],
-        'channel_url': get_config()['channel_url'],
-        'share_option': get_config()['share_option'],
-        'bypass_ssl': get_config()['bypass_ssl'],
-        "file_logging": get_config()['file_logging'],
-        'component_policy': get_config()['component_policy'],
-        'update_policy': get_config()['update_policy'],
-        'windows_selector_event_loop_policy': get_config()['windows_selector_event_loop_policy'],
-        'model_download_by_agent': get_config()['model_download_by_agent'],
-        'downgrade_blacklist': get_config()['downgrade_blacklist'],
-        'security_level': get_config()['security_level'],
-        'always_lazy_install': get_config()['always_lazy_install'],
-        'network_mode': get_config()['network_mode'],
-        'db_mode': get_config()['db_mode'],
-    }
+
+class DirtyTrackingConfig(dict):
+    """Config mapping that records which keys were changed after it was built.
+
+    `write_config()` must persist ONLY the setting a caller actually changed,
+    otherwise it re-writes the other keys from the process-lifetime startup
+    snapshot and silently reverts whatever the user hand-edited in the
+    meantime. Every settings caller mutates the cached config the same way -
+    a subscript assignment such as `get_config()['db_mode'] = mode` - so
+    recording `__setitem__` is what makes "only what changed" knowable.
+    `update()` is covered too, so a future caller written that way cannot
+    lose its change silently.
+
+    The wrapper is applied in `get_config()` AFTER `read_config()` has
+    returned, and that ordering is load-bearing:
+    `manager_migration.force_security_level_if_needed()` mutates the config
+    through a parameter alias from inside BOTH `read_config()` branches. If
+    that mutation were recorded, `security_level` would be dirty before the
+    user does anything, and every write would push the forced value over the
+    user's on-disk one - the exact clobber this tracking exists to remove.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dirty_keys = set()
+
+    def __setitem__(self, key, value):
+        self.dirty_keys.add(key)
+        super().__setitem__(key, value)
+
+    def update(self, *args, **kwargs):
+        incoming = dict(*args, **kwargs)
+        self.dirty_keys.update(incoming)
+        super().update(incoming)
+
+
+def write_config():
+    """Persist changed Manager settings without clobbering the rest of the file.
+
+    The write starts from what is CURRENTLY on disk and overlays only the keys
+    a caller actually changed (tracked by `DirtyTrackingConfig`) plus the live
+    `preview_method`. Consequences, in the order users notice them:
+
+      - a value hand-edited while the server is up is no longer reverted by an
+        unrelated settings change;
+      - keys this function does not own (`http_channel_enabled`,
+        `default_cache_as_channel_url`, anything a user added) survive;
+      - sections other than `[default]` survive.
+
+    Reads still come from the startup snapshot until the process restarts, so
+    the "stop -> edit -> start" advice in the install-denial messages stays
+    correct; what changes is that the edit is no longer destroyed in between.
+    """
+    config = configparser.ConfigParser(strict=False)
+    try:
+        loaded = config.read(manager_config_path)
+    except Exception as e:
+        # An unparsable config.ini must not make a settings change raise. Fall
+        # back to the pre-merge behaviour and rewrite the file from scratch.
+        print(f"[ComfyUI-Manager] Warning: '{manager_config_path}' could not be parsed ({e}); rewriting it from the current settings.")
+        config = configparser.ConfigParser(strict=False)
+    else:
+        # `read()` opens each filename inside its own `try/except OSError` and
+        # SKIPS the ones it could not open, so a file that exists but denies
+        # reads comes back as a normal return with an EMPTY parser - not as the
+        # exception handled above. Merging from that parser would find no
+        # `[default]`, fall into the bootstrap branch below, and rewrite the
+        # file from defaults: every foreign key and every other section gone,
+        # with the settings change still reporting success.
+        #
+        # A write that cannot see the current contents has nothing to merge
+        # onto, so refuse it and leave the file alone. The caller surfaces the
+        # error (the settings endpoint answers 500), which is what the same
+        # permission problem already does when writes are denied too.
+        if not loaded and os.path.exists(manager_config_path):
+            raise OSError(f"'{manager_config_path}' exists but could not be read; refusing to overwrite it with default settings. Fix the file's permissions, then retry.")
+
+    cached = get_config()
+
+    if config.has_section('default'):
+        # Ordinary settings change: persist only what this caller changed.
+        # The `getattr` fallback covers a `cached_config` that is a plain dict
+        # (nothing in this tree does that - it is here so a caller that
+        # bypasses get_config() degrades to the old full rewrite rather than
+        # writing nothing at all).
+        changed_keys = getattr(cached, 'dirty_keys', set(WRITTEN_CONFIG_KEYS))
+        # Intersecting with WRITTEN_CONFIG_KEYS means a key this function does
+        # not own is NOT persisted even when a caller dirties it - unchanged
+        # from before, since those keys were never written either. Two such
+        # keys are live in the config today (`http_channel_enabled`,
+        # `default_cache_as_channel_url`): an endpoint that wants to persist
+        # one must add it to WRITTEN_CONFIG_KEYS, or the write will silently
+        # do nothing.
+        keys = [key for key in WRITTEN_CONFIG_KEYS if key in changed_keys]
+    else:
+        # Bootstrap: no `[default]` on disk (fresh install - the caller at
+        # manager_server.py:2098 is guarded by `if not os.path.exists`), or a
+        # file that could not be parsed. Seed the full default set.
+        config['default'] = {}
+        keys = list(WRITTEN_CONFIG_KEYS)
+
+    updates = {key: cached[key] for key in keys}
+    # `preview_method` is written on EVERY write, from the live value rather
+    # than from disk - it is the one setting the running process, not the
+    # file, is authoritative for. So it is also the one key a hand edit does
+    # not survive; that is unchanged behaviour, not a gap in the merge.
+    updates['preview_method'] = manager_funcs.get_current_preview_method()
+
+    section = config['default']
+    for key, value in updates.items():
+        # Sanitize to prevent CRLF injection. Applied to the values written
+        # here; values already on disk are carried through verbatim, so the
+        # merge cannot corrupt hand-maintained content.
+        section[key] = str(value).replace('\r', '').replace('\n', '').replace('\x00', '')
 
     directory = os.path.dirname(manager_config_path)
     if not os.path.exists(directory):
@@ -1707,6 +1889,22 @@ def write_config():
 
     with open(manager_config_path, 'w') as configfile:
         config.write(configfile)
+
+    # The write succeeded, so these keys now MATCH the file and are no longer
+    # pending changes. Without this the set is add-only: a key the user once
+    # changed through the UI stays dirty for the life of the process, and the
+    # next unrelated write overlays its stale cached value back over whatever
+    # the user has hand-edited since - the same clobber this function exists to
+    # remove, just deferred by one settings change.
+    #
+    # Discard exactly the keys THIS write persisted, never the whole set: a
+    # caller may have dirtied a key that was not selected here - one this
+    # function does not own, and therefore one it never persists at all (the
+    # WRITTEN_CONFIG_KEYS note above). That marker is not this write's to
+    # drop; `clear()` would lose it. The hasattr guard mirrors the `getattr`
+    # above, for a cache that is a plain dict.
+    if hasattr(cached, 'dirty_keys'):
+        cached.dirty_keys.difference_update(keys)
 
 
 def read_config():
@@ -1740,6 +1938,9 @@ def read_config():
                     'network_mode': default_conf.get('network_mode', 'public').lower(),
                     'security_level': default_conf.get('security_level', 'normal').lower(),
                     'db_mode': default_conf.get('db_mode', 'cache').lower(),
+                    'allow_git_url_install': get_bool('allow_git_url_install', False),
+                    'allow_pip_install': get_bool('allow_pip_install', False),
+                    'allow_flagged_nodepack_install': get_bool('allow_flagged_nodepack_install', False),
                }
         manager_migration.force_security_level_if_needed(result)
         return result
@@ -1769,6 +1970,9 @@ def read_config():
             'network_mode': 'public',   # public | private | offline
             'security_level': 'normal', # strong | normal | normal- | weak
             'db_mode': 'cache',         # local | cache | remote
+            'allow_git_url_install': False,
+            'allow_pip_install': False,
+            'allow_flagged_nodepack_install': False,
         }
         manager_migration.force_security_level_if_needed(result)
         return result
@@ -1778,7 +1982,11 @@ def get_config():
     global cached_config
 
     if cached_config is None:
-        cached_config = read_config()
+        # Wrapped HERE, after read_config() has returned: the migration hook it
+        # calls internally mutates the config through a parameter alias, and
+        # that mutation must NOT count as a user change (see
+        # DirtyTrackingConfig).
+        cached_config = DirtyTrackingConfig(read_config())
         if cached_config['http_channel_enabled']:
             print("[ComfyUI-Manager] Warning: http channel enabled, make sure server in secure env")
 
@@ -3172,15 +3380,20 @@ async def restore_snapshot(snapshot_path, git_helper_extras=None):
                     skip_node_packs.append(f"{x[0]}@{x[1]}")
                 elif not ps.result:
                     failed.append(f"{x[0]}@{x[1]}")
+                    logging.error(ps.msg)
 
-            # install listed cnr nodes
+            # Do not retry processed switches as fresh installs.
+            checked_cnr = {node_id for node_id, _ in todo_checkout}
             for k, v in cnr_info.items():
-                if 'comfyui-manager' in k:
+                if 'comfyui-manager' in k or k in checked_cnr:
                     continue
 
                 ps = await unified_manager.install_by_id(k, version_spec=v, instant_execution=True, return_postinstall=True)
                 if ps.action == 'install-cnr' and ps.result:
                     installed_node_packs.append(f"{k}@{v}")
+                elif not ps.result:
+                    failed.append(f"{k}@{v}")
+                    logging.error(ps.msg)
 
                 if ps is not None and ps.result:
                     if hasattr(ps, 'postinstall'):

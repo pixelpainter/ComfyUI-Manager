@@ -384,18 +384,123 @@ When you run the `scan.sh` script:
       * all feature is available
     
   * `high` level risky features
-    * `Install via git url`, `pip install`
-    * Installation of custom nodes registered not in the `default channel`.
-    * Fix custom nodes
+    * Downloading models that are not in `.safetensors` format and not
+      registered in the `default channel` model list
+    * NOTE: `Install via git url`, `pip install`, and installation of custom nodes
+      not registered in the `default channel` are **no longer governed by
+      `security_level`** — they are governed by the dedicated install flags
+      described below.
   
   * `middle` level risky features
     * Uninstall/Update
     * Installation of custom nodes registered in the `default channel`.
+    * Fix custom nodes
     * Restore/Remove Snapshot
     * Restart
   
   * `low` level risky features
     * Update ComfyUI
+
+### Dedicated install flags: `allow_git_url_install` / `allow_pip_install`
+
+The two arbitrary-install surfaces are governed by dedicated boolean keys in
+`config.ini` (`[default]` section), fully **decoupled** from `security_level`:
+
+  * `allow_git_url_install`
+    * governs `Install via Git URL` (`POST /customnode/install/git_url`) **and**
+      the unknown-git-URL arm of the batch install queue
+      (`POST /manager/queue/install`, including reinstall delegation) — i.e.
+      installing any custom node from a git URL that is not registered in the
+      `default channel` catalog
+    * on the **batch queue path**, the flag is **necessary but not
+      sufficient**: the queue's normal `security_level` entry gate (`middle`)
+      must ALSO pass — at `security_level = strong`, batch unknown-URL
+      installs stay denied even with the flag set to `true` (only the direct
+      `Install via Git URL` endpoint is fully independent of `security_level`)
+    * covers the **entire install transaction** it starts, including the
+      pack's transitive dependency pip installs
+  * `allow_pip_install`
+    * governs **only** the standalone `pip install` feature
+      (`POST /customnode/install/pip`)
+
+Key properties:
+
+  * **Decoupled from `security_level` (replace, not and)** — on the two
+    **direct endpoints** (`Install via Git URL` and `pip install`),
+    `security_level` no longer has any effect in either direction: a strict
+    level cannot deny them when the flag is `true`, and a weak level cannot
+    allow them when the flag is `false`. (The batch queue path keeps its
+    `security_level` entry gate in ADDITION to the flag — see the scope bullet
+    above.) Every other gated feature remains governed by `security_level` as
+    described above.
+  * **Loopback only** — the flags take effect **only** when the server listens
+    on a loopback address (e.g. `--listen 127.0.0.1`). On a non-loopback
+    listener these surfaces stay denied regardless of the flags; the flags
+    never widen the exposure of a public deployment.
+  * **Default deny / explicit opt-in** — both flags default to `false`. Only
+    the case-insensitive string `true` enables a flag; a missing or malformed
+    key reads as `false`.
+
+To opt in, edit `config.ini`:
+
+```ini
+[default]
+allow_git_url_install = true
+allow_pip_install = true
+```
+
+Changes take effect after a **restart** (no hot reload).
+
+> **Migration note**: there is no automatic migration from `security_level`.
+> If you previously relied on `security_level = weak` (or `normal-`) to use
+> install-via-git-URL / pip install, you must opt in explicitly with the flags
+> above. See `CHANGELOG.md` for details, including a behavior note for
+> outdated ComfyUI deployments.
+
+
+### Flagged CNR versions: `allow_flagged_nodepack_install`
+
+Manager checks the version status in the existing CNR install response; no
+additional Registry request is needed. Active versions continue to install
+normally, subject to the existing security policy. Registry refusals (including
+HTTP 404) still prevent installation.
+
+Flagged versions must also satisfy the existing security policy and Registry
+checks. In addition, they require either **all** `--listen` addresses to be
+loopback, such as `127.0.0.1` or `::1`, or the explicit override below.
+A mixed loopback/non-loopback listener is non-local.
+
+For a **trusted private network**, administrators can explicitly allow flagged
+versions on non-loopback listeners:
+
+```ini
+[default]
+allow_flagged_nodepack_install = true
+```
+
+The default is `false`; only the case-insensitive value `true` enables it.
+Restart ComfyUI after editing the setting. This option does not detect private
+networks and is independent of `network_mode`. It does not bypass
+`security_level`, `allow_git_url_install`, or `allow_pip_install`.
+
+When the flagged-version check denies an action, the UI reports that the current
+security configuration does not allow it and directs users to the terminal.
+Only the terminal provides the loopback-only `--listen` examples, the private
+network override setting, and the instruction to restart ComfyUI after changes.
+
+Enabling an already installed version does not query the Registry or reinstall it.
+Older deferred switches without a stored status require loopback-only listeners
+or the override. Otherwise they are rejected without changing the installed pack;
+request the installation again so Manager can check its current Registry status.
+
+The check applies to server-initiated installation, reinstallation, version switches, updates,
+and snapshot restores. A policy refusal preserves the existing nodepack.
+Scheduled version switches save the returned status and check the current
+listener and setting again at startup, before downloading or running scripts.
+Server-scheduled snapshot restores inherit the permission computed from the
+server's current listener and setting. Standalone `cm-cli` commands remain local
+administrator operations and do not use the server listener policy.
+Saved statuses are not refreshed from the Registry.
 
 
 # Disclaimer

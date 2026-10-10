@@ -3,17 +3,27 @@ import { $el } from "../../scripts/ui.js";
 import {
 	manager_instance, rebootAPI,
 	fetchData, md5, icons, show_message, customAlert, infoToast, showTerminal,
-	storeColumnWidth, restoreColumnWidth, loadCss, handle403Response
+	storeColumnWidth, restoreColumnWidth, loadCss, formatSize, sizeToBytes,
+	sanitizeHTML, safeHref
 } from  "./common.js";
 import { api } from "../../scripts/api.js";
 
 // https://cenfun.github.io/turbogrid/api.html
-import TG from "./turbogrid.esm.js";
+import ManagerGrid from "./manager-grid.js";
 import { buildGuiFrameCustomHeader,  createSettingsCombo } from "./comfyui-gui-builder.js";
 
 loadCss("./model-manager.css");
 
 const gridId = "model";
+
+// Escape raw cells while preserving empty values.
+const escapeCell = (value) => (value === null || value === undefined) ? value : sanitizeHTML(String(value));
+
+// Escape option markup while comparing the original values.
+const renderOptions = (list, current) => list.map(item => {
+	const selected = item.value === current ? " selected" : "";
+	return `<option value="${sanitizeHTML(String(item.value))}"${selected}>${sanitizeHTML(String(item.label))}</option>`;
+}).join("");
 
 const pageHtml = `
 <div class="cmm-manager cmm-manager-dark">
@@ -101,22 +111,13 @@ export class ModelManager {
 
 	updateFilter() {
 		const $filter  = this.element.querySelector(".cmm-manager-filter");
-		$filter.innerHTML = this.filterList.map(item => {
-			const selected = item.value === this.filter ? " selected" : "";
-			return `<option value="${item.value}"${selected}>${item.label}</option>`
-		}).join("");
+		$filter.innerHTML = renderOptions(this.filterList, this.filter);
 
 		const $type  = this.element.querySelector(".cmm-manager-type");
-		$type.innerHTML = this.typeList.map(item => {
-			const selected = item.value === this.type ? " selected" : "";
-			return `<option value="${item.value}"${selected}>${item.label}</option>`
-		}).join("");
+		$type.innerHTML = renderOptions(this.typeList, this.type);
 
 		const $base  = this.element.querySelector(".cmm-manager-base");
-		$base.innerHTML = this.baseList.map(item => {
-			const selected = item.value === this.base ? " selected" : "";
-			return `<option value="${item.value}"${selected}>${item.label}</option>`
-		}).join("");
+		$base.innerHTML = renderOptions(this.baseList, this.base);
 
 	}
 
@@ -170,7 +171,7 @@ export class ModelManager {
 
 			".cmm-manager-stop": {
 				click: () => {
-					api.fetchApi('/manager/queue/reset');
+					api.fetchApi('/manager/queue/reset', { method: 'POST' });
 					infoToast('Cancel', 'Remaining tasks will stop after completing the current task.');
 				}
 			},
@@ -199,7 +200,7 @@ export class ModelManager {
 
 	initGrid() {
 		const container = this.element.querySelector(".cmm-manager-grid");
-		const grid = new TG.Grid(container);
+		const grid = new ManagerGrid(container);
 		this.grid = grid;
 		
 		grid.bind('onUpdated', (e, d) => {
@@ -227,6 +228,9 @@ export class ModelManager {
         });
 
 		grid.setOption({
+			highlightKeywords: {
+				textGenerator: (row, column) => ['name', 'description'].includes(column) ? row[column] : escapeCell(row[column])
+			},
 			theme: 'dark',
 
 			selectVisible: true,
@@ -325,7 +329,8 @@ export class ModelManager {
 			maxWidth: 500,
 			classMap: 'cmm-node-name',
 			formatter: function(name, rowItem, columnItem, cellNode) {
-				return `<a href=${rowItem.reference} target="_blank"><b>${name}</b></a>`;
+				// Names are server-escaped; raw references need URL and attribute handling.
+				return `<a href="${safeHref(rowItem.reference)}" target="_blank" rel="noopener noreferrer"><b>${name}</b></a>`;
 			}
 		}, {
 			id: 'installed',
@@ -351,7 +356,7 @@ export class ModelManager {
 			sortable: false,
 			align: 'center',
 			formatter: (url, rowItem, columnItem) => {
-				return `<a class="cmm-btn-download" tooltip="Download file" href="${url}" target="_blank">${icons.download}</a>`;
+				return `<a class="cmm-btn-download" title="Download file" href="${safeHref(url)}" target="_blank" rel="noopener noreferrer">${icons.download}</a>`;
 			}
 		}, {
 			id: 'size',
@@ -359,18 +364,21 @@ export class ModelManager {
 			width: 100,
 			formatter: (size) => {
 				if (typeof size === "number") {
-					return this.formatSize(size);
+					return formatSize(size);
 				}
 				return size;
 			}
 		}, {
 			id: 'type',
 			name: 'Type',
-			width: 100
+			width: 100,
+			formatter: escapeCell
 		}, {
 			id: 'base',
-			name: 'Base'
+			name: 'Base',
+			formatter: escapeCell
 		}, {
+			// Descriptions are formatted HTML from the server.
 			id: 'description',
 			name: 'Description',
 			width: 400,
@@ -379,11 +387,13 @@ export class ModelManager {
 		}, {
 			id: "save_path",
 			name: 'Save Path',
-			width: 200
+			width: 200,
+			formatter: escapeCell
 		}, {
 			id: 'filename',
 			name: 'Filename',
-			width: 200
+			width: 200,
+			formatter: escapeCell
 		}];
 
 		restoreColumnWidth(gridId, columns);
@@ -444,7 +454,7 @@ export class ModelManager {
 		let needRefresh = false;
 		let errorMsg = "";
 
-		await api.fetchApi('/manager/queue/reset');
+		await api.fetchApi('/manager/queue/reset', { method: 'POST' });
 
 		let target_items = [];
 
@@ -458,6 +468,7 @@ export class ModelManager {
 				});
 			}
 
+			// Model names are already escaped by the server.
 			this.showStatus(`Install ${item.name} ...`);
 
 			const data = item.originalData;
@@ -483,7 +494,7 @@ export class ModelManager {
 						errorMsg += `This action is not allowed with this security level configuration.\n`;
 					}
 				} else {
-					errorMsg += await res.text() + '\n';
+					errorMsg += sanitizeHTML(await res.text()) + '\n';
 				}
 
 				break;
@@ -503,7 +514,7 @@ export class ModelManager {
 			}
 		}
 		else {
-			await api.fetchApi('/manager/queue/start');
+			await api.fetchApi('/manager/queue/start', { method: 'POST' });
 			this.showStop();
 			showTerminal();
 		}
@@ -552,8 +563,9 @@ export class ModelManager {
 		for(let hash in result){
 			let v = result[hash];
 
+			// Escape raw task errors for both HTML message destinations.
 			if(v != 'success')
-				errorMsg += v + '\n';
+				errorMsg += sanitizeHTML(String(v)) + '\n';
 		}
 
 		for(let k in self.install_context.targets) {
@@ -582,7 +594,7 @@ export class ModelManager {
 		models.forEach((item, i) => {
 			const { type, base, name, reference, installed } = item;
 			item.originalData = JSON.parse(JSON.stringify(item));
-			item.size = this.sizeToBytes(item.size);
+			item.size = sizeToBytes(item.size);
 			item.hash = md5(name + reference);
 			item.id = i + 1;
 
@@ -659,7 +671,6 @@ export class ModelManager {
 		const { models } = res.data;
 
 		this.modelList = this.getModelList(models);
-		// console.log("models", this.modelList);
 
 		this.updateFilter();
 		
@@ -671,56 +682,7 @@ export class ModelManager {
 
 	// ===========================================================================================
 
-	formatSize(v) {
-		const base = 1000;
-        const units = ['', 'K', 'M', 'G', 'T', 'P'];
-        const space = '';
-        const postfix = 'B';
-		if (v <= 0) {
-			return `0${space}${postfix}`;
-		}
-		for (let i = 0, l = units.length; i < l; i++) {
-			const min = Math.pow(base, i);
-			const max = Math.pow(base, i + 1);
-			if (v > min && v <= max) {
-				const unit = units[i];
-				if (unit) {
-					const n = v / min;
-					const nl = n.toString().split('.')[0].length;
-					const fl = Math.max(3 - nl, 1);
-					v = n.toFixed(fl);
-				}
-				v = v + space + unit + postfix;
-				break;
-			}
-		}
-		return v;
-	}
-
-	// for size sort
-	sizeToBytes(v) {
-		if (typeof v === "number") {
-			return v;
-		}
-		if (typeof v === "string") {
-			const n = parseFloat(v);
-			const unit = v.replace(/[0-9.B]+/g, "").trim().toUpperCase();
-			if (unit === "K") {
-				return n * 1000;
-			}
-			if (unit === "M") {
-				return n * 1000 * 1000;
-			}
-			if (unit === "G") {
-				return n * 1000 * 1000 * 1000;
-			}
-			if (unit === "T") {
-				return n * 1000 * 1000 * 1000 * 1000;
-			}
-		}
-		return v;
-	}
-
+	// Messages accept HTML; see createUIStateManager in common.js.
 	showSelection(msg) {
 		this.element.querySelector(".cmm-manager-selection").innerHTML = msg;
 	}

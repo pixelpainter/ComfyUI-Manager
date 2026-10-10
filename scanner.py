@@ -2,6 +2,8 @@ import ast
 import re
 import os
 import json
+import threading
+from collections import defaultdict
 from git import Repo
 import concurrent
 import datetime
@@ -15,12 +17,13 @@ builtin_nodes = set()
 import sys
 
 from urllib.parse import urlparse
+from urllib3.util.retry import Retry
 from github import Github, Auth
 from pathlib import Path
 from typing import Set, Dict, Optional
 
 # Scanner version for cache invalidation
-SCANNER_VERSION = "2.0.11"  # Multi-layer detection: class existence + display names
+SCANNER_VERSION = "2.0.13"  # Add fallback for dynamic v3 node_id
 
 # Cache for extract_nodes and extract_nodes_enhanced results
 _extract_nodes_cache: Dict[str, Set[str]] = {}
@@ -194,6 +197,82 @@ g = None
 
 
 parse_cnt = 0
+
+# Thread-safe git error state
+_git_error_lock = threading.Lock()
+_git_errors: defaultdict = defaultdict(list)  # category -> list[{'repo': str, 'op': str, 'msg': str}]
+
+# Ordered categories: (key, display label, compiled regex). First match wins.
+# Single source of truth — add new categories here only.
+_GIT_ERROR_CATEGORIES = [
+    ('repository_not_found', 'Repository Not Found', re.compile(
+        r'repository\s+not\s+found|does\s+not\s+exist|\b404\b|remote:\s*repository\s+not\s+found',
+        re.IGNORECASE
+    )),
+    ('divergent_branch', 'Divergent Branch', re.compile(
+        r'divergent\s+branches|need\s+to\s+specify\s+how\s+to\s+reconcile\s+divergent\s+branches',
+        re.IGNORECASE
+    )),
+    ('auth_failed', 'Authentication Failed', re.compile(
+        r'authentication\s+failed|could\s+not\s+read\s+username|invalid\s+username|invalid\s+password|auth\s+failed',
+        re.IGNORECASE
+    )),
+    ('network_error', 'Network Error', re.compile(
+        r'could\s+not\s+resolve\s+host|connection\s+refused|timed?\s*out|failed\s+to\s+connect|'
+        r'network\s+is\s+unreachable|temporary\s+failure\s+in\s+name\s+resolution',
+        re.IGNORECASE
+    )),
+    ('merge_conflict', 'Merge Conflict', re.compile(
+        r'merge\s+conflict|\bCONFLICT\b|automatic\s+merge\s+failed',
+        re.IGNORECASE
+    )),
+    ('permission_denied', 'Permission Denied', re.compile(
+        r'permission\s+denied|access\s+denied|operation\s+not\s+permitted|publickey',
+        re.IGNORECASE
+    )),
+]
+
+
+def _categorize_git_error(error_str: str) -> str:
+    """Classify a git error string into a category. First match wins."""
+    for category, _label, pattern in _GIT_ERROR_CATEGORIES:
+        if pattern.search(error_str):
+            return category
+    return 'other'
+
+
+def _record_git_error(repo_name: str, op: str, error: Exception) -> None:
+    """Record a git error in the thread-safe collector."""
+    category = _categorize_git_error(str(error))
+    with _git_error_lock:
+        _git_errors[category].append({'repo': repo_name, 'op': op, 'msg': str(error)})
+
+
+def _report_git_errors() -> None:
+    """Print a grouped summary of git errors by category."""
+    if not _git_errors:
+        return
+
+    total = sum(len(v) for v in _git_errors.values())
+    print(f"\n{'='*60}")
+    print(f"Git Operation Errors Summary: {total} failure(s)")
+    print(f"{'='*60}")
+
+    for category, label, _pattern in _GIT_ERROR_CATEGORIES:
+        entries = _git_errors.get(category, [])
+        if not entries:
+            continue
+        print(f"\n[{label}] ({len(entries)} repo(s))")
+        for entry in entries:
+            print(f"  • {entry['repo']} ({entry['op']}): {entry['msg']}")
+
+    other_entries = _git_errors.get('other', [])
+    if other_entries:
+        print(f"\n[Other] ({len(other_entries)} repo(s))")
+        for entry in other_entries:
+            print(f"  • {entry['repo']} ({entry['op']}): {entry['msg']}")
+
+    print(f"{'='*60}\n")
 
 
 def extract_nodes(code_text):
@@ -552,12 +631,22 @@ def extract_nodes_enhanced(
             if exists:
                 phase5_nodes.add(node_name)
 
-    # Union all results (FIX: Scanner 2.0.9 bug + Scanner 2.0.10 bug)
+    # Phase 6: Dict comprehension pattern (NEW in 2.0.12)
+    # Detects: NODE_CLASS_MAPPINGS = {cls.__name__: cls for cls in to_export}
+    # Example: TobiasGlaubach/ComfyUI-TG_PyCode
+    phase6_nodes = _fallback_dict_comprehension(code_text, file_path)
+
+    # Phase 7: Import-based class names for dict comprehension (NEW in 2.0.12)
+    # Detects imported classes that are added to export lists
+    phase7_nodes = _fallback_import_class_names(code_text, file_path)
+
+    # Union all results (FIX: Scanner 2.0.9 bug + Scanner 2.0.10 bug + Scanner 2.0.12 dict comp)
     # 2.0.9: Used early return which missed Phase 3 nodes
     # 2.0.10: Only checked registrations, missed classes referenced in display names
-    all_nodes = phase1_nodes | phase2_nodes | phase3_nodes | phase4_nodes | phase5_nodes
+    # 2.0.12: Added dict comprehension and import-based class detection
+    all_nodes = phase1_nodes | phase2_nodes | phase3_nodes | phase4_nodes | phase5_nodes | phase6_nodes | phase7_nodes
 
-    # Phase 6: Empty dict detector (logging only, doesn't add nodes)
+    # Phase 8: Empty dict detector (logging only, doesn't add nodes)
     if not all_nodes:
         _fallback_empty_dict_detector(code_text, file_path, verbose)
 
@@ -616,7 +705,7 @@ def _fallback_classname_resolver(code_text: str, file_path: Optional[Path]) -> S
 def _fallback_item_assignment(code_text: str) -> Set[str]:
     """
     Detect item assignment pattern.
-    
+
     Pattern:
         NODE_CLASS_MAPPINGS = {}
         NODE_CLASS_MAPPINGS["MyNode"] = MyNode
@@ -627,9 +716,9 @@ def _fallback_item_assignment(code_text: str) -> Set[str]:
             parsed = ast.parse(code_text)
     except:
         return set()
-    
+
     nodes = set()
-    
+
     for node in ast.walk(parsed):
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -640,8 +729,154 @@ def _fallback_item_assignment(code_text: str) -> Set[str]:
                         if isinstance(target.slice, ast.Constant):
                             if isinstance(target.slice.value, str):
                                 nodes.add(target.slice.value)
-    
+
     return nodes
+
+
+def _fallback_dict_comprehension(code_text: str, file_path: Optional[Path] = None) -> Set[str]:
+    """
+    Detect dict comprehension pattern with __name__ attribute access.
+
+    Pattern:
+        NODE_CLASS_MAPPINGS = {cls.__name__: cls for cls in to_export}
+        NODE_CLASS_MAPPINGS = {c.__name__: c for c in [ClassA, ClassB]}
+
+    This function detects dict comprehension assignments to NODE_CLASS_MAPPINGS
+    and extracts class names from the iterable (list literal or variable reference).
+
+    Returns:
+        Set of class names extracted from the dict comprehension
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', category=SyntaxWarning)
+            parsed = ast.parse(code_text)
+    except:
+        return set()
+
+    nodes = set()
+    export_lists = {}  # Track list variables and their contents
+
+    # First pass: collect list assignments (to_export = [...], exports = [...])
+    for node in ast.walk(parsed):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    var_name = target.id
+                    # Check for list literal
+                    if isinstance(node.value, ast.List):
+                        class_names = set()
+                        for elt in node.value.elts:
+                            if isinstance(elt, ast.Name):
+                                class_names.add(elt.id)
+                        export_lists[var_name] = class_names
+
+        # Handle augmented assignment: to_export += [...]
+        elif isinstance(node, ast.AugAssign):
+            if isinstance(node.target, ast.Name) and isinstance(node.op, ast.Add):
+                var_name = node.target.id
+                if isinstance(node.value, ast.List):
+                    class_names = set()
+                    for elt in node.value.elts:
+                        if isinstance(elt, ast.Name):
+                            class_names.add(elt.id)
+                    if var_name in export_lists:
+                        export_lists[var_name].update(class_names)
+                    else:
+                        export_lists[var_name] = class_names
+
+    # Second pass: find NODE_CLASS_MAPPINGS dict comprehension
+    for node in ast.walk(parsed):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in ['NODE_CLASS_MAPPINGS', 'NODE_CONFIG']:
+                    # Check for dict comprehension
+                    if isinstance(node.value, ast.DictComp):
+                        dictcomp = node.value
+
+                        # Check if key is cls.__name__ pattern
+                        key = dictcomp.key
+                        if isinstance(key, ast.Attribute) and key.attr == '__name__':
+                            # Get the iterable from the first generator
+                            for generator in dictcomp.generators:
+                                iter_node = generator.iter
+
+                                # Case 1: Inline list [ClassA, ClassB, ...]
+                                if isinstance(iter_node, ast.List):
+                                    for elt in iter_node.elts:
+                                        if isinstance(elt, ast.Name):
+                                            nodes.add(elt.id)
+
+                                # Case 2: Variable reference (to_export, exports, etc.)
+                                elif isinstance(iter_node, ast.Name):
+                                    var_name = iter_node.id
+                                    if var_name in export_lists:
+                                        nodes.update(export_lists[var_name])
+
+    return nodes
+
+
+def _fallback_import_class_names(code_text: str, file_path: Optional[Path] = None) -> Set[str]:
+    """
+    Extract class names from imports that are added to export lists.
+
+    Pattern:
+        from .module import ClassA, ClassB
+        to_export = [ClassA, ClassB]
+        NODE_CLASS_MAPPINGS = {cls.__name__: cls for cls in to_export}
+
+    This is a complementary fallback that works with _fallback_dict_comprehension
+    to resolve import-based node registrations.
+
+    Returns:
+        Set of imported class names that appear in export-like contexts
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', category=SyntaxWarning)
+            parsed = ast.parse(code_text)
+    except:
+        return set()
+
+    # Collect imported names
+    imported_names = set()
+    for node in ast.walk(parsed):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                name = alias.asname if alias.asname else alias.name
+                imported_names.add(name)
+
+    # Check if these names appear in list assignments that feed into NODE_CLASS_MAPPINGS
+    export_candidates = set()
+    has_dict_comp_mapping = False
+
+    for node in ast.walk(parsed):
+        # Check for dict comprehension NODE_CLASS_MAPPINGS
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == 'NODE_CLASS_MAPPINGS':
+                    if isinstance(node.value, ast.DictComp):
+                        has_dict_comp_mapping = True
+
+        # Collect list contents
+        if isinstance(node, ast.Assign):
+            if isinstance(node.value, ast.List):
+                for elt in node.value.elts:
+                    if isinstance(elt, ast.Name) and elt.id in imported_names:
+                        export_candidates.add(elt.id)
+
+        # Handle augmented assignment
+        elif isinstance(node, ast.AugAssign):
+            if isinstance(node.value, ast.List):
+                for elt in node.value.elts:
+                    if isinstance(elt, ast.Name) and elt.id in imported_names:
+                        export_candidates.add(elt.id)
+
+    # Only return if there's a dict comprehension mapping
+    if has_dict_comp_mapping:
+        return export_candidates
+
+    return set()
 
 
 def _extract_repo_name(file_path: Path) -> str:
@@ -780,6 +1015,9 @@ def extract_v3_nodes(code_text):
                 node_id = extract_node_id_from_schema(node)
                 if node_id:
                     nodes.add(node_id)
+                else:
+                    # Fallback: use class name when node_id is dynamic/empty
+                    nodes.add(node.name)
 
     return nodes
 
@@ -1001,7 +1239,7 @@ def clone_or_pull_git_repository(git_url):
     repo_name = git_url.split("/")[-1]
     if repo_name.endswith(".git"):
         repo_name = repo_name[:-4]
-        
+
     repo_dir = os.path.join(temp_dir, repo_name)
 
     if os.path.exists(repo_dir):
@@ -1013,12 +1251,14 @@ def clone_or_pull_git_repository(git_url):
             print(f"Pulling {repo_name}...")
         except Exception as e:
             print(f"Failed to pull '{repo_name}': {e}")
+            _record_git_error(repo_name, 'pull', e)
     else:
         try:
             Repo.clone_from(git_url, repo_dir, recursive=True)
             print(f"Cloning {repo_name}...")
         except Exception as e:
             print(f"Failed to clone '{repo_name}': {e}")
+            _record_git_error(repo_name, 'clone', e)
 
 
 def update_custom_nodes(scan_only_mode=False, url_list_file=None):
@@ -1169,10 +1409,17 @@ def update_custom_nodes(scan_only_mode=False, url_list_file=None):
     if not skip_stat_update:
         process_git_stats(git_url_titles_preemptions)
 
+    # Reset error collector before this run
+    with _git_error_lock:
+        _git_errors.clear()
+
     # Git clone/pull for all repositories
     with concurrent.futures.ThreadPoolExecutor(11) as executor:
         for url, title, preemptions, node_pattern in git_url_titles_preemptions:
             executor.submit(process_git_url_title, url, title, preemptions, node_pattern)
+
+    # Report any git errors grouped by category (after all workers complete)
+    _report_git_errors()
 
     # .py file download (skip in scan-only mode - only process git repos)
     if not scan_only_mode:
@@ -1373,7 +1620,14 @@ if __name__ == "__main__":
 
     if not skip_stat_update:
         auth = Auth.Token(os.environ.get('GITHUB_TOKEN'))
-        g = Github(auth=auth)
+        # Use a plain urllib3 Retry (NOT PyGithub's default GithubRetry) so that
+        # a GitHub rate-limit response (403/429) raises RateLimitExceededException
+        # IMMEDIATELY instead of sleeping until the rate-limit reset and retrying
+        # up to 10x. The except-block in renew_stat() then catches it and skips
+        # (returns None). 403/429 are intentionally NOT in status_forcelist, so
+        # they fail fast; only transient 5xx errors are retried.
+        g = Github(auth=auth, retry=Retry(total=2, backoff_factor=0.5,
+                                          status_forcelist=[500, 502, 503, 504]))
     else:
         g = None
 

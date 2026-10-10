@@ -6,13 +6,13 @@ import { buildGuiFrameCustomHeader,  createSettingsCombo } from "./comfyui-gui-b
 import {
 	manager_instance, rebootAPI, install_via_git_url,
 	fetchData, md5, icons, show_message, customConfirm, customAlert, customPrompt,
-	sanitizeHTML, infoToast, showTerminal, setNeedRestart,
+	sanitizeHTML, sanitizeUrl, infoToast, showTerminal, setNeedRestart,
 	storeColumnWidth, restoreColumnWidth, getTimeAgo, copyText, loadCss,
-	showPopover, hidePopover, handle403Response
+	showPopover, hidePopover, getWorkflowNodeTypes, findPackageByCnrId, analyzeWorkflowUsage, createFlyover
 } from  "./common.js";
 
 // https://cenfun.github.io/turbogrid/api.html
-import TG from "./turbogrid.esm.js";
+import ManagerGrid from "./manager-grid.js";
 
 loadCss("./custom-nodes-manager.css");
 
@@ -42,6 +42,8 @@ const ShowMode = {
 	FAVORITES: "Favorites",
 	ALTERNATIVES: "Alternatives",
 	IN_WORKFLOW: "In Workflow",
+	USED_IN_ANY_WORKFLOW: "Used In Any Workflow",
+	NOT_USED_IN_ANY_WORKFLOW: "Installed and Unused",
 };
 
 export class CustomNodesManager {
@@ -272,6 +274,14 @@ export class CustomNodesManager {
 			value: ShowMode.IN_WORKFLOW,
 			hasData: false
 		}, {
+			label: "Used In Any Workflow",
+			value: ShowMode.USED_IN_ANY_WORKFLOW,
+			hasData: false
+		}, {
+			label: "Installed and Unused",
+			value: ShowMode.NOT_USED_IN_ANY_WORKFLOW,
+			hasData: false
+		}, {
 			label: "Missing",
 			value: ShowMode.MISSING,
 			hasData: false
@@ -364,18 +374,17 @@ export class CustomNodesManager {
 		}
 
 		let list = installGroups[action];
+		if (!Array.isArray(list)) {
+			return "";
+		}
 
 		if(is_selected_button || rowItem?.version === "unknown") {
 			list = list.filter(it => it !== "switch");
 		}
 
-		if (!list) {
-			return "";
-		}
-
 		return list.map(id => {
 			const bt = buttons[id];
-			return `<button class="cn-btn-${id} p-button p-component" group="${action}" mode="${bt.mode}">${bt.label}</button>`;
+			return `<button class="cn-btn-${id} p-button p-component" group="${sanitizeHTML(String(action))}" mode="${bt.mode}">${bt.label}</button>`;
 		}).join("");
 	}
 
@@ -462,7 +471,7 @@ export class CustomNodesManager {
 
 			".cn-manager-stop": {
 				click: () => {
-					api.fetchApi('/manager/queue/reset');
+					api.fetchApi('/manager/queue/reset', { method: 'POST' });
 					infoToast('Cancel', 'Remaining tasks will stop after completing the current task.');
 				}
 			},
@@ -518,10 +527,14 @@ export class CustomNodesManager {
 
 	initGrid() {
 		const container = this.element.querySelector(".cn-manager-grid");
-		const grid = new TG.Grid(container);
+		const grid = new ManagerGrid(container);
 		this.grid = grid;
 
-		this.flyover = this.createFlyover(container);
+		this.flyover = createFlyover(container, {
+			enableHover: true,
+			hoverHandler: this.handleFlyoverHover.bind(this),
+			context: this
+		});
 		
 		let prevViewRowsLength = -1;
 		grid.bind('onUpdated', (e, d) => {
@@ -579,6 +592,9 @@ export class CustomNodesManager {
 
 
 		grid.setOption({
+			highlightKeywords: {
+				textGenerator: (row, column) => column === 'author' ? sanitizeHTML(String(row[column] ?? '')) : row[column]
+			},
 			theme: 'dark',
 			selectVisible: true,
 			selectMultiple: true,
@@ -684,7 +700,8 @@ export class CustomNodesManager {
 			id: 'id',
 			name: 'ID',
 			width: 50,
-			align: 'center'
+			align: 'center',
+			formatter: (value) => (value === null || value === undefined) ? value : sanitizeHTML(String(value))
 		}, {
 			id: 'title',
 			name: 'Title',
@@ -710,11 +727,13 @@ export class CustomNodesManager {
 				}
 
 				const link = document.createElement('a');
+				// DOM href takes a validated raw URL, without HTML attribute escaping.
 				if(rowItem.originalData.repository)
-					link.href = rowItem.originalData.repository;
+					link.href = sanitizeUrl(rowItem.originalData.repository);
 				else
-					link.href = rowItem.reference;
+					link.href = sanitizeUrl(rowItem.reference);
 				link.target = '_blank';
+				link.rel = 'noopener noreferrer';
 				link.innerHTML = `<b>${title}</b>`;
 				link.title = rowItem.originalData.id;
 				container.appendChild(link);
@@ -732,13 +751,15 @@ export class CustomNodesManager {
 				if(!version) {
 					return;
 				}
+				const safeVersion = sanitizeHTML(String(version));
 				if(rowItem.cnr_latest && version != rowItem.cnr_latest) {
+					const safeLatest = sanitizeHTML(String(rowItem.cnr_latest));
 					if(version == 'nightly') {
-						return `<div>${version}</div><div>[${rowItem.cnr_latest}]</div>`;
+						return `<div>${safeVersion}</div><div>[${safeLatest}]</div>`;
 					}
-					return `<div>${version}</div><div>[↑${rowItem.cnr_latest}]</div>`;
+					return `<div>${safeVersion}</div><div>[↑${safeLatest}]</div>`;
 				}
-				return version;
+				return safeVersion;
 			}
 		}, {
 			id: 'action',
@@ -790,10 +811,11 @@ export class CustomNodesManager {
 			width: 120,
 			classMap: "cn-pack-author", 
 			formatter: (author, rowItem, columnItem) => {
+				const safeAuthor = sanitizeHTML(String(author ?? ''));
 				if (rowItem.trust) {
-					return `<span tooltip="This author has been active for more than six months in GitHub">✅ ${author}</span>`;
+					return `<span title="This author has been active for more than six months in GitHub">✅ ${safeAuthor}</span>`;
 				}
-				return author;
+				return safeAuthor;
 			}
 		}, {
 			id: 'stars',
@@ -807,7 +829,7 @@ export class CustomNodesManager {
 				if (typeof stars === 'number') {
 					return stars.toLocaleString();
 				}
-				return stars;
+				return (stars === null || stars === undefined) ? stars : sanitizeHTML(String(stars));
 			}
 		}, {
 			id: 'last_update',
@@ -821,8 +843,8 @@ export class CustomNodesManager {
 					return 'N/A';
 				}
 				const ago = getTimeAgo(last_update);
-				const short = `${last_update}`.split(' ')[0];
-				return `<span tooltip="${ago}">${short}</span>`;
+				const short = sanitizeHTML(String(last_update).split(' ')[0]);
+				return `<span title="${ago}">${short}</span>`;
 			}
 		}];
 
@@ -1063,143 +1085,63 @@ export class CustomNodesManager {
 		hidePopover();
 	}
 
-	createFlyover(container) {
-		const $flyover = document.createElement("div");
-		$flyover.className = "cn-flyover";
-		$flyover.innerHTML = `<div class="cn-flyover-header">
-			<div class="cn-flyover-close">${icons.arrowRight}</div>
-			<div class="cn-flyover-title"></div>
-			<div class="cn-flyover-close">${icons.close}</div>
-			</div>
-			<div class="cn-flyover-body"></div>`
-		container.appendChild($flyover);
-
-		const $flyoverTitle = $flyover.querySelector(".cn-flyover-title");
-		const $flyoverBody = $flyover.querySelector(".cn-flyover-body");
-		
-		let width = '50%';
-		let visible = false;
-
-		let timeHide;
-		const closeHandler = (e) => {
-            if ($flyover === e.target || $flyover.contains(e.target)) {
-                return;
-            }
-			clearTimeout(timeHide);
-			timeHide = setTimeout(() => {
-				flyover.hide();
-			}, 100);
-		}
-
-		const hoverHandler = (e) => {
-			if(e.type === "mouseenter") {
-				if(e.target.classList.contains("cn-nodes-name")) {
-					this.showNodePreview(e.target);
-				}
-				return;
-			}
-			this.hideNodePreview();
-		}
-
-		const displayHandler = () => {
-			if (visible) {
-				$flyover.classList.remove("cn-slide-in-right");
-			} else {
-				$flyover.classList.remove("cn-slide-out-right");
-				$flyover.style.width = '0px';
-				$flyover.style.display = "none";
-			}
-		}
-
-		const flyover = {
-			show: (titleHtml, bodyHtml) => {
-				clearTimeout(timeHide);
-				this.element.removeEventListener("click", closeHandler);
-				$flyoverTitle.innerHTML = titleHtml;
-				$flyoverBody.innerHTML = bodyHtml;
-				$flyover.style.display = "block";
-				$flyover.style.width = width;
-				if(!visible) {
-					$flyover.classList.add("cn-slide-in-right");
-				}
-				visible = true;
-				setTimeout(() => {
-					this.element.addEventListener("click", closeHandler);
-				}, 100);
-			},
-			hide: (now) => {
-				visible = false;
-				this.element.removeEventListener("click", closeHandler);
-				if(now) {
-					displayHandler();
-					return;
-				}
-				$flyover.classList.add("cn-slide-out-right");
-			}
-		}
-
-		$flyover.addEventListener("animationend", (e) => {
-			displayHandler();
-		});
-
-		$flyover.addEventListener("mouseenter", hoverHandler, true);
-		$flyover.addEventListener("mouseleave", hoverHandler, true);
-
-		$flyover.addEventListener("click", (e) => {
-
+	handleFlyoverHover(e) {
+		if(e.type === "mouseenter") {
 			if(e.target.classList.contains("cn-nodes-name")) {
-				const nodeName = e.target.innerText;
-				const nodeItem = this.nodeMap[nodeName];
-				if (!nodeItem) {
-					copyText(nodeName).then((res) => {
-						if (res) {
-							e.target.setAttribute("action", "Copied");
-							e.target.classList.add("action");
-							setTimeout(() => {
-								e.target.classList.remove("action");
-								e.target.removeAttribute("action");
-							}, 1000);
-						}
-					});
-					return;
-				}
+				this.showNodePreview(e.target);
+			}
+			return;
+		}
+		this.hideNodePreview();
+	}
 
-				const [x, y, w, h] = app.canvas.ds.visible_area;
-				const dpi = Math.max(window.devicePixelRatio ?? 1, 1);
-				const node = window.LiteGraph?.createNode(
-					nodeItem.name,
-					nodeItem.display_name,
-					{
-						pos: [x + (w-300) / dpi / 2, y]
+	handleFlyoverClick(e) {
+		if(e.target.classList.contains("cn-nodes-name")) {
+			const nodeName = e.target.innerText;
+			const nodeItem = this.nodeMap[nodeName];
+			if (!nodeItem) {
+				copyText(nodeName).then((res) => {
+					if (res) {
+						e.target.setAttribute("action", "Copied");
+						e.target.classList.add("action");
+						setTimeout(() => {
+							e.target.classList.remove("action");
+							e.target.removeAttribute("action");
+						}, 1000);
 					}
-				);
-				if (node) {
-					app.graph.add(node);
-					e.target.setAttribute("action", "Added to Workflow");
-					e.target.classList.add("action");
-					setTimeout(() => {
-						e.target.classList.remove("action");
-						e.target.removeAttribute("action");
-					}, 1000);
-				}
-				
+				});
 				return;
 			}
-			if(e.target.classList.contains("cn-nodes-pack")) {
-				const hash = e.target.getAttribute("hash");
-				const rowItem = this.grid.getRowItemBy("hash", hash);
-				//console.log(rowItem);
-				this.grid.scrollToRow(rowItem);
-				this.addHighlight(rowItem);
-				return;
-			}
-			if(e.target.classList.contains("cn-flyover-close")) {
-				flyover.hide();
-				return;
-			}
-		});
 
-		return flyover;
+			const [x, y, w, h] = app.canvas.ds.visible_area;
+			const dpi = Math.max(window.devicePixelRatio ?? 1, 1);
+			const node = window.LiteGraph?.createNode(
+				nodeItem.name,
+				nodeItem.display_name,
+				{
+					pos: [x + (w-300) / dpi / 2, y]
+				}
+			);
+			if (node) {
+				app.graph.add(node);
+				e.target.setAttribute("action", "Added to Workflow");
+				e.target.classList.add("action");
+				setTimeout(() => {
+					e.target.classList.remove("action");
+					e.target.removeAttribute("action");
+				}, 1000);
+			}
+			
+			return;
+		}
+		if(e.target.classList.contains("cn-nodes-pack")) {
+			const hash = e.target.getAttribute("hash");
+			const rowItem = this.grid.getRowItemBy("hash", hash);
+				//console.log(rowItem);
+			this.grid.scrollToRow(rowItem);
+			this.addHighlight(rowItem);
+			return;
+		}
 	}
 
 	showNodes(d) {
@@ -1211,6 +1153,7 @@ export class CustomNodesManager {
 		const rowItem = d.rowItem;
 		const isNotInstalled = rowItem.action == "not-installed";
 
+		// Pack titles are already escaped by the server.
 		let titleHtml = `<div class="cn-nodes-pack" hash="${rowItem.hash}">${rowItem.title}</div>`;
 		if (isNotInstalled) {
 			titleHtml += '<div class="cn-pack-badge">Not Installed</div>'
@@ -1227,7 +1170,8 @@ export class CustomNodesManager {
 
 			list.push(`<div class="${rowClass}">`);
 			list.push(`<div class="cn-nodes-sn">${i+1}</div>`);
-			list.push(`<div class="cn-nodes-name">${it.name}</div>`);
+			// extName via /customnode/getmappings, no server sanitize: escaped at the sink.
+			list.push(`<div class="cn-nodes-name">${sanitizeHTML(String(it.name))}</div>`);
 
 			if (it.conflicts) {
 				list.push(`<div class="cn-conflicts-list"><div class="cn-nodes-conflict cn-icon">${icons.conflicts}</div><b>Conflict with</b>${it.conflicts.map(c => {
@@ -1349,7 +1293,7 @@ export class CustomNodesManager {
 			return;
 		}
 
-		const selectedMap = {};
+		const selectedMap = Object.create(null);
 		selectedList.forEach(item => {
 			let type = item.action;
 			if (item.restart) {
@@ -1368,7 +1312,7 @@ export class CustomNodesManager {
 		Object.keys(selectedMap).forEach(v => {
 			const filterItem = this.getFilterItem(v);
 			list.push(`<div class="cn-selected-buttons">
-				<span>Selected <b>${selectedMap[v].length}</b> ${filterItem ? filterItem.label : v}</span>
+				<span>Selected <b>${selectedMap[v].length}</b> ${sanitizeHTML(String(filterItem ? filterItem.label : v))}</span>
 				${this.grid.hasMask ? "" : this.getActionButtons(v, null, true)}
 			</div>`);
 		});
@@ -1476,9 +1420,15 @@ export class CustomNodesManager {
 		let needRestart = false;
 		let errorMsg = "";
 
-		await api.fetchApi('/manager/queue/reset');
+		await api.fetchApi('/manager/queue/reset', { method: 'POST' });
 
+		// Set install_context BEFORE per-item queue enqueue calls so that any
+		// server-side synchronous completion (e.g., sync enable of an inactive
+		// node) that emits cm-queue-status before we return here still finds
+		// install_context populated in onQueueCompleted. target_items is shared
+		// by reference so further pushes below remain visible.
 		let target_items = [];
+		this.install_context = {btn: btn, targets: target_items};
 
 		for (const hash of list) {
 			const item = this.grid.getRowItemBy("hash", hash);
@@ -1527,6 +1477,7 @@ export class CustomNodesManager {
 			});
 
 			if (res.status != 200) {
+				// The title is already escaped by populate_markdown.
 				errorMsg = `'${item.title}': `;
 
 				if(res.status == 403) {
@@ -1540,17 +1491,13 @@ export class CustomNodesManager {
 					} catch {
 						errorMsg += `This action is not allowed with this security level configuration.\n`;
 					}
-				} else if(res.status == 404) {
-					errorMsg += `With the current security level configuration, only custom nodes from the <B>"default channel"</B> can be installed.\n`;
 				} else {
-					errorMsg += await res.text() + '\n';
+					errorMsg += sanitizeHTML(await res.text()) + '\n';
 				}
 
 				break;
 			}
 		}
-
-		this.install_context = {btn: btn, targets: target_items};
 
 		if(errorMsg) {
 			this.showError(errorMsg);
@@ -1563,7 +1510,7 @@ export class CustomNodesManager {
 			}
 		}
 		else {
-			await api.fetchApi('/manager/queue/start');
+			await api.fetchApi('/manager/queue/start', { method: 'POST' });
 			this.showStop();
 			showTerminal();
 		}
@@ -1576,6 +1523,10 @@ export class CustomNodesManager {
 
 			const item = self.grid.getRowItemBy("hash", hash);
 
+			if (!item) {
+				return;
+			}
+
 			item.restart = true;
 			self.restartMap[item.hash] = true;
 			self.grid.updateCell(item, "action");
@@ -1583,45 +1534,82 @@ export class CustomNodesManager {
 		}
 		else if(event.detail.status == 'done') {
 			self.hideStop();
-			self.onQueueCompleted(event.detail);
+			// Await + error logging so any unhandled rejection surfaces to the
+			// console instead of silently swallowing completion finalization
+			// (root cause of disable/enable button staying loading with no toast).
+			try {
+				await self.onQueueCompleted(event.detail);
+			} catch (e) {
+				console.error("[ComfyUI-Manager] onQueueCompleted failed:", e);
+			}
 		}
 	}
 
 	async onQueueCompleted(info) {
+		// `nodepack_result` is a dict serialized from a Python dict, not an array.
+		// `dict.length` is `undefined` and `undefined == 0` is `false`, so the
+		// previous `result.length == 0` guard was a no-op; switch to a correct
+		// empty-check that also tolerates null/undefined.
 		let result = info.nodepack_result;
 
-		if(result.length == 0) {
+		if (!result || Object.keys(result).length === 0) {
 			return;
 		}
 
 		let self = CustomNodesManager.instance;
 
-		if(!self.install_context) {
+		if (!self || !self.install_context) {
 			return;
 		}
 
 		const { target, label, mode } = self.install_context.btn;
-		target.classList.remove("cn-btn-loading");
+		const targets = self.install_context.targets || [];
 
+		// Compute errorMsg upfront so the downstream user-visible finalization
+		// (showRestart / showMessage / infoToast) fires regardless of whether
+		// any DOM-touching step below throws.
 		let errorMsg = "";
-
-		for(let hash in result){
+		for (let hash in result) {
 			let v = result[hash];
-
-			if(v != 'success' && v != 'skip')
-				errorMsg += v+'\n';
+			if (v != 'success' && v != 'skip') {
+				// Escape raw task errors for both HTML message destinations.
+				errorMsg += sanitizeHTML(String(v)) + '\n';
+			}
 		}
 
-		for(let k in self.install_context.targets) {
-			let item = self.install_context.targets[k];
-			self.grid.updateCell(item, "action");
+		// Defensive: `target` may be a detached DOM node (the in_progress
+		// handler's updateCell can re-render the row and replace the button
+		// element). classList.remove on a detached node is a no-op, but we
+		// still guard in case target was torn down entirely.
+		try {
+			if (target && target.classList) {
+				target.classList.remove("cn-btn-loading");
+			}
+		} catch (e) {
+			console.warn("[ComfyUI-Manager] Failed to clear button loading state:", e);
+		}
+
+		// Defensive: grid.updateCell can throw if the item was removed or the
+		// grid was re-rendered between in_progress and done. Do NOT let this
+		// loop abort the completion finalization below — that was the observed
+		// failure mode for disable/enable (no toast, no "restart required"
+		// message).
+		try {
+			for (let k in targets) {
+				let item = targets[k];
+				if (item) {
+					self.grid.updateCell(item, "action");
+				}
+			}
+		} catch (e) {
+			console.warn("[ComfyUI-Manager] Failed to refresh target cells after queue completion:", e);
 		}
 
 		if (errorMsg) {
 			self.showError(errorMsg);
-			show_message("Installation Error:\n"+errorMsg);
+			show_message("Installation Error:\n" + errorMsg);
 		} else {
-			self.showStatus(`${label} ${result.length} custom node(s) successfully`);
+			self.showStatus(`${label} ${Object.keys(result).length} custom node(s) successfully`);
 		}
 
 		self.showRestart();
@@ -1777,7 +1765,7 @@ export class CustomNodesManager {
 		this.showStatus(`Loading missing nodes (${mode}) ...`);
 		const res = await fetchData(`/customnode/getmappings?mode=${mode}`);
 		if (res.error) {
-			this.showError(`Failed to get custom node mappings: ${res.error}`);
+			this.showError(`Failed to get custom node mappings: ${sanitizeHTML(String(res.error))}`);
 			return;
 		}
 
@@ -1874,7 +1862,10 @@ export class CustomNodesManager {
 		for(let k in allUsedNodes) {
 			var item;
 			if(allUsedNodes[k].properties.cnr_id) {
-				item = this.custom_nodes[allUsedNodes[k].properties.cnr_id];
+				const foundPackage = findPackageByCnrId(allUsedNodes[k].properties.cnr_id, this.custom_nodes, false);
+				if (foundPackage) {
+					item = foundPackage.pack;
+				}
 			}
 			else if(allUsedNodes[k].properties.aux_id) {
 				item = aux_id_to_pack[allUsedNodes[k].properties.aux_id];
@@ -1892,7 +1883,7 @@ export class CustomNodesManager {
 		this.showStatus(`Loading alternatives (${mode}) ...`);
 		const res = await fetchData(`/customnode/alternatives?mode=${mode}`);
 		if (res.error) {
-			this.showError(`Failed to get alternatives: ${res.error}`);
+			this.showError(`Failed to get alternatives: ${sanitizeHTML(String(res.error))}`);
 			return [];
 		}
 
@@ -1908,8 +1899,9 @@ export class CustomNodesManager {
 				continue;
 			}
 
+			// tags (alter-list.json) is not server-transformed, so escape before innerHTML.
 			const tags = `${item.tags}`.split(",").map(tag => {
-				return `<div>${tag.trim()}</div>`;
+				return `<div>${sanitizeHTML(tag.trim())}</div>`;
 			}).join("");
 
 			hashMap[custom_node.hash] = {
@@ -1919,6 +1911,48 @@ export class CustomNodesManager {
 		}
 	
 		return hashMap;
+	}
+
+	async getUsedInAnyWorkflow() {
+		this.showStatus(`Loading workflow usage analysis ...`);
+		
+		const result = await analyzeWorkflowUsage(this.custom_nodes);
+		
+		if (!result.success) {
+			this.showError(`Failed to get workflow data: ${sanitizeHTML(String(result.error))}`);
+			return {};
+		}
+		
+		const hashMap = {};
+		
+		// Convert usage map keys to hash map
+		result.usageMap.forEach((count, packageKey) => {
+			const pack = this.custom_nodes[packageKey];
+			if (pack && pack.hash) {
+				hashMap[pack.hash] = true;
+			}
+		});
+		
+		return hashMap;
+	}
+
+	async getNotUsedInAnyWorkflow() {
+		this.showStatus(`Loading workflow usage analysis ...`);
+		
+		// Get the used packages first using common utility
+		const usedHashMap = await this.getUsedInAnyWorkflow();
+		const notUsedHashMap = {};
+		
+		// Find all installed packages that are NOT in the used list
+		for(let k in this.custom_nodes) {
+			let nodepack = this.custom_nodes[k];
+			// Only consider installed packages
+			if (nodepack.state !== "not-installed" && !usedHashMap[nodepack.hash]) {
+				notUsedHashMap[nodepack.hash] = true;
+			}
+		}
+		
+		return notUsedHashMap;
 	}
 
 	async loadData(show_mode = ShowMode.NORMAL) {
@@ -1956,7 +1990,7 @@ export class CustomNodesManager {
 		this.custom_nodes = node_packs;
 
 		if(this.channel !== 'default') {
-			this.element.querySelector(".cn-manager-channel").innerHTML = `Channel: ${this.channel} (Incomplete list)`;
+			this.element.querySelector(".cn-manager-channel").innerHTML = `Channel: ${sanitizeHTML(String(this.channel))} (Incomplete list)`;
 		}
 
 		for (const k in node_packs) {
@@ -1990,6 +2024,10 @@ export class CustomNodesManager {
 				hashMap = await this.getFavorites();
 			} else if(this.show_mode == ShowMode.IN_WORKFLOW) {
 				hashMap = await this.getNodepackInWorkflow();
+			} else if(this.show_mode == ShowMode.USED_IN_ANY_WORKFLOW) {
+				hashMap = await this.getUsedInAnyWorkflow();
+			} else if(this.show_mode == ShowMode.NOT_USED_IN_ANY_WORKFLOW) {
+				hashMap = await this.getNotUsedInAnyWorkflow();
 			}
 			filterItem.hashMap = hashMap;
 
@@ -2084,6 +2122,7 @@ export class CustomNodesManager {
 
 	// ===========================================================================================
 
+	// Messages accept HTML; see createUIStateManager in common.js.
 	showSelection(msg) {
 		this.element.querySelector(".cn-manager-selection").innerHTML = msg;
 	}
